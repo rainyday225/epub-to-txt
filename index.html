@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EPUB 轉 TXT 工具</title>
+    <link rel="manifest" href="manifest.json">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        :root { --primary: #4CAF50; --bg: #f4f4f9; --text: #333; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px; max-width: 600px; margin: 0 auto; line-height: 1.6; }
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        h1 { font-size: 1.5rem; text-align: center; color: var(--primary); }
+        .file-input { margin-bottom: 15px; width: 100%; }
+        button { background: var(--primary); color: white; border: none; padding: 12px 20px; border-radius: 8px; width: 100%; font-size: 1rem; cursor: pointer; transition: opacity 0.3s; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        #log { margin-top: 15px; font-size: 0.9rem; color: #666; max-height: 150px; overflow-y: auto; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h1>EPUB 轉 TXT</h1>
+    <p>選擇單一 EPUB 將匯出 TXT；選擇多個將打包為 ZIP。</p>
+    
+    <input type="file" id="fileInput" class="file-input" accept=".epub" multiple>
+    <!-- 若要支援直接選取資料夾，可加上 webkitdirectory 屬性，但在手機上支援度不一，因此以 multiple 為主 -->
+    
+    <button id="convertBtn">開始轉換</button>
+    <div id="log"></div>
+</div>
+
+<script>
+    // 註冊 Service Worker 實現 PWA
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('sw.js').catch(console.error);
+    }
+
+    const fileInput = document.getElementById('fileInput');
+    const convertBtn = document.getElementById('convertBtn');
+    const logDiv = document.getElementById('log');
+
+    function log(msg) {
+        logDiv.innerHTML += `<div>${msg}</div>`;
+        logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    // 核心功能：解析單一 EPUB 為 TXT
+    async function parseEpubToText(file) {
+        const zip = new JSZip();
+        await zip.loadAsync(file);
+        
+        // 1. 讀取 container.xml 找到 OPF 檔案路徑
+        const containerData = await zip.file("META-INF/container.xml").async("string");
+        const parser = new DOMParser();
+        const containerDoc = parser.parseFromString(containerData, "text/xml");
+        const rootfile = containerDoc.querySelector("rootfile").getAttribute("full-path");
+        
+        // 2. 讀取 OPF 檔案
+        const opfData = await zip.file(rootfile).async("string");
+        const opfDoc = parser.parseFromString(opfData, "text/xml");
+        const basePath = rootfile.substring(0, rootfile.lastIndexOf("/") + 1);
+        
+        // 3. 取得檔案清單與閱讀順序 (spine)
+        const manifest = {};
+        opfDoc.querySelectorAll("manifest > item").forEach(item => {
+            manifest[item.getAttribute("id")] = item.getAttribute("href");
+        });
+        
+        const spine = Array.from(opfDoc.querySelectorAll("spine > itemref")).map(itemref => itemref.getAttribute("idref"));
+        
+        // 4. 依序提取文字
+        let fullText = "";
+        for (const id of spine) {
+            const href = manifest[id];
+            if (href) {
+                const filePath = basePath + href;
+                const fileInZip = zip.file(filePath);
+                if (fileInZip) {
+                    const htmlData = await fileInZip.async("string");
+                    const htmlDoc = parser.parseFromString(htmlData, "text/html");
+                    // 移除多餘空白，保留基本換行
+                    let text = htmlDoc.body ? htmlDoc.body.innerText || htmlDoc.body.textContent : "";
+                    if (text.trim()) fullText += text.trim() + "\n\n";
+                }
+            }
+        }
+        return fullText;
+    }
+
+    function downloadBlob(blob, filename) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    convertBtn.addEventListener('click', async () => {
+        const files = fileInput.files;
+        if (files.length === 0) return alert("請先選擇 EPUB 檔案");
+        
+        convertBtn.disabled = true;
+        logDiv.innerHTML = "";
+        
+        try {
+            if (files.length === 1) {
+                // 單檔轉換：直接匯出 TXT
+                log(`處理單一檔案: ${files[0].name}`);
+                const text = await parseEpubToText(files[0]);
+                const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+                const txtName = files[0].name.replace(/\.epub$/i, '.txt');
+                downloadBlob(blob, txtName);
+                log("轉換完成！");
+            } else {
+                // 批次轉換：打包成 ZIP
+                log(`處理多個檔案，共 ${files.length} 個`);
+                const outZip = new JSZip();
+                
+                for (let i = 0; i < files.length; i++) {
+                    const file = files[i];
+                    log(`正在轉換: ${file.name} ...`);
+                    const text = await parseEpubToText(file);
+                    const txtName = file.name.replace(/\.epub$/i, '.txt');
+                    outZip.file(txtName, text);
+                }
+                
+                log("正在打包 ZIP 檔案...");
+                const zipBlob = await outZip.generateAsync({ type: "blob" });
+                // 使用第一個檔案所在的相對路徑做為資料夾名，若無則預設為 Batch_Export
+                let folderName = "Batch_Export";
+                if (files[0].webkitRelativePath) {
+                    folderName = files[0].webkitRelativePath.split('/')[0];
+                }
+                downloadBlob(zipBlob, `${folderName}.zip`);
+                log("全部轉換完成！");
+            }
+        } catch (err) {
+            console.error(err);
+            log(`<span style="color:red">發生錯誤: ${err.message}</span>`);
+        } finally {
+            convertBtn.disabled = false;
+        }
+    });
+</script>
+</body>
+</html>
